@@ -107,8 +107,9 @@ if not ADMIN_TOKEN:
 ADMIN_TOKENS = {ADMIN_HOST: ADMIN_TOKEN}
 
 # (optional but recommended) also let secrets come from env
-PIXEL_SHARED_SECRET    = os.getenv("PIXEL_SHARED_SECRET", PIXEL_SHARED_SECRET)
-SHOPIFY_WEBHOOK_SECRET = os.getenv("SHOPIFY_WEBHOOK_SECRET", SHOPIFY_WEBHOOK_SECRET)
+PIXEL_SHARED_SECRET = os.environ["PIXEL_SHARED_SECRET"]          # raises if missing
+SHOPIFY_WEBHOOK_SECRET = os.environ["SHOPIFY_WEBHOOK_SECRET"]    # raises if missing
+
 
 
 # Ignore views/ATC from these IPs/CIDRs
