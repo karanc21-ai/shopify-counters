@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+events.csv
+atc_events.csv
+view_counts.json
+atc_counts.json
+sales_counts.json
+sale_dates.json
+processed_orders.json
+.env
