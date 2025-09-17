@@ -16,9 +16,9 @@ DIRECTIONS TO RUN
 4. Within a few seconds you’ll see a line with a URL like:"https://disciplinary-truck-probe-mug.trycloudflare.com ", copy this URL
 5. Open shopify customer events pixels and replace the URL with this url in the fetch() lines
 
-- Receives Web Pixel 'product_viewed' hits  → custom.views_total
-- Receives Web Pixel 'product_added_to_cart' → custom.added_to_cart_total
-- Receives 'orders/paid' webhook            → custom.sales_total, custom.sales_dates
+- Receives Web Pixel 'product_viewed' hits     → custom.views_total
+- Receives Web Pixel 'product_added_to_cart'   → custom.added_to_cart_total
+- Receives 'orders/paid' webhook               → custom.sales_total, custom.sales_dates
 - NEW: Recomputes 'custom.age_in_days' daily from custom.dob or product.createdAt
 - Pushes metafields via Admin GraphQL every FLUSH_INTERVAL_SEC
 """
@@ -211,8 +211,8 @@ def _persist_all():
 
 def _cors(resp):
     resp.headers["Access-Control-Allow-Origin"] = "*"
-    resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
-    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Shopify-Topic, X-Shopify-Hmac-SHA256, X-Shopify-Shop-Domain"
+    resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS, GET"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Shopify-Topic, X-Shopify-Hmac-SHA256, X-Shopify-Shop-Domain, X-Forwarded-For, CF-Connecting-IP, True-Client-IP"
     return resp
 
 @app.route("/health", methods=["GET"])
@@ -223,6 +223,50 @@ def health():
 @app.route("/track/product", methods=["OPTIONS"])
 def track_options():
     return _cors(make_response("", 204))
+
+def _compute_age_for_pid(pid: str, today_date):
+    """Compute & mark dirty age for one product. Returns True if changed."""
+    # fetch dob from cache or Admin
+    dob = dob_cache.get(pid)
+    if not dob:
+        dob = fetch_product_dob(pid)
+        if dob:
+            dob_cache[pid] = dob
+    if not dob:
+        return False  # unknown DOB
+
+    # parse to date
+    try:
+        if "T" in dob:
+            dob_date = datetime.fromisoformat(dob.replace("Z","+00:00")).date()
+        else:
+            from datetime import datetime as dtmod
+            dob_date = dtmod.strptime(dob, "%Y-%m-%d").date()
+    except Exception:
+        return False
+
+    new_age = max((today_date - dob_date).days, 0)
+    old_age = age_days.get(pid, -1)
+    if new_age != old_age:
+        age_days[pid] = new_age
+        dirty_age.add(("rudradhan.com", pid))  # host value unused in push; just a marker
+        return True
+    return False
+
+def _recompute_age_for_known_pids():
+    today = datetime.now(timezone.utc).date()
+    with lock:
+        pids = set(view_counts.keys()) | set(atc_counts.keys()) | set(sales_counts.keys())
+    changed = 0
+    for pid in pids:
+        try:
+            if _compute_age_for_pid(pid, today):
+                changed += 1
+        except Exception:
+            pass
+    if changed:
+        _persist_all()
+    return changed
 
 @app.route("/track/product", methods=["POST"])
 def track_product():
@@ -256,6 +300,11 @@ def track_product():
     with lock:
         view_counts[product_id] = int(view_counts.get(product_id, 0)) + 1
         dirty_views.add((shop_host, product_id))
+    # compute age immediately so age_in_days appears without waiting
+    try:
+        _compute_age_for_pid(product_id, datetime.now(timezone.utc).date())
+    except Exception:
+        pass
 
     return _cors(make_response(("ok", 200)))
 
@@ -299,8 +348,22 @@ def track_atc():
     with lock:
         atc_counts[product_id] = int(atc_counts.get(product_id, 0)) + qty
         dirty_atc.add((shop_host, product_id))
+    # compute age immediately
+    try:
+        _compute_age_for_pid(product_id, datetime.now(timezone.utc).date())
+    except Exception:
+        pass
 
     return _cors(make_response(("ok", 200)))
+
+# --------- Manual age recompute endpoint (force now) ---------
+@app.route("/age/recompute", methods=["GET","POST"])
+def age_recompute_now():
+    key = (request.args.get("key") or "").strip()
+    if key != PIXEL_SHARED_SECRET:
+        return "forbidden", 403
+    changed = _recompute_age_for_known_pids()
+    return f"recomputed ages for {changed} product(s)", 200
 
 # --------- WEBHOOK endpoint: /webhook/orders_paid (sales) ---------
 def verify_hmac(req_body: bytes, header_hmac: str) -> bool:
@@ -371,6 +434,11 @@ def orders_paid():
                     sale_dates[pid] = set(newest_sorted)
 
             dirty_sales.add((shop_host, pid))
+            # compute age immediately
+            try:
+                _compute_age_for_pid(pid, datetime.now(timezone.utc).date())
+            except Exception:
+                pass
 
     return "ok", 200
 
@@ -477,10 +545,9 @@ def flusher():
 
         mfs = []
         for pid, kinds in to_push.items():
-            oid = f"gid://shopify/Product/{pid}"
             if "views" in kinds:
                 mfs.append({
-                    "ownerId": oid,
+                    "ownerId": f"gid://shopify/Product/{pid}",
                     "namespace": METAFIELD_NS,
                     "key": KEY_VIEWS,
                     "type": "number_integer",
@@ -488,7 +555,7 @@ def flusher():
                 })
             if "atc" in kinds:
                 mfs.append({
-                    "ownerId": oid,
+                    "ownerId": f"gid://shopify/Product/{pid}",
                     "namespace": METAFIELD_NS,
                     "key": KEY_ATC,
                     "type": "number_integer",
@@ -496,7 +563,7 @@ def flusher():
                 })
             if "sales" in kinds:
                 mfs.append({
-                    "ownerId": oid,
+                    "ownerId": f"gid://shopify/Product/{pid}",
                     "namespace": METAFIELD_NS,
                     "key": KEY_SALES,
                     "type": "number_integer",
@@ -504,7 +571,7 @@ def flusher():
                 })
                 dates = sorted(list(sale_dates.get(pid, set())))  # list.date expects JSON array of strings
                 mfs.append({
-                    "ownerId": oid,
+                    "ownerId": f"gid://shopify/Product/{pid}",
                     "namespace": METAFIELD_NS,
                     "key": KEY_DATES,
                     "type": "list.date",
@@ -512,7 +579,7 @@ def flusher():
                 })
             if "age" in kinds:
                 mfs.append({
-                    "ownerId": oid,
+                    "ownerId": f"gid://shopify/Product/{pid}",
                     "namespace": METAFIELD_NS,
                     "key": KEY_AGE,
                     "type": "number_integer",
@@ -545,26 +612,11 @@ def daily_age_updater():
                 pids = set(view_counts.keys()) | set(atc_counts.keys()) | set(sales_counts.keys())
             changed = 0
             for pid in pids:
-                dob = dob_cache.get(pid)
-                if not dob:
-                    dob = fetch_product_dob(pid)
-                    if dob:
-                        dob_cache[pid] = dob
-                if not dob:
-                    continue
                 try:
-                    if "T" in dob:
-                        dob_date = datetime.fromisoformat(dob.replace("Z","+00:00")).date()
-                    else:
-                        dob_date = datetime.strptime(dob, "%Y-%m-%d").date()
+                    if _compute_age_for_pid(pid, today):
+                        changed += 1
                 except Exception:
-                    continue
-                new_age = max((today - dob_date).days, 0)
-                old_age = age_days.get(pid, -1)
-                if new_age != old_age:
-                    age_days[pid] = new_age
-                    dirty_age.add(("rudradhan.com", pid))
-                    changed += 1
+                    pass
             if changed:
                 print(f"[AGE] recomputed ages for {changed} product(s)")
                 _persist_all()
