@@ -19,6 +19,7 @@ DIRECTIONS TO RUN
 - Receives Web Pixel 'product_viewed' hits  → custom.views_total
 - Receives Web Pixel 'product_added_to_cart' → custom.added_to_cart_total
 - Receives 'orders/paid' webhook            → custom.sales_total, custom.sales_dates
+- NEW: Recomputes 'custom.age_in_days' daily from custom.dob or product.createdAt
 - Pushes metafields via Admin GraphQL every FLUSH_INTERVAL_SEC
 """
 
@@ -95,6 +96,7 @@ KEY_VIEWS     = "views_total"
 KEY_SALES     = "sales_total"
 KEY_DATES     = "sales_dates"             # list.date
 KEY_ATC       = "added_to_cart_total"     # number_integer
+KEY_AGE       = "age_in_days"             # number_integer (NEW)
 
 COUNT_MODE    = "units"                   # "units" or "orders"
 SALES_DATES_LIMIT = 365                   # keep up to N unique sale dates per product
@@ -109,8 +111,6 @@ ADMIN_TOKENS = {ADMIN_HOST: ADMIN_TOKEN}
 # (optional but recommended) also let secrets come from env
 PIXEL_SHARED_SECRET = os.environ["PIXEL_SHARED_SECRET"]          # raises if missing
 SHOPIFY_WEBHOOK_SECRET = os.environ["SHOPIFY_WEBHOOK_SECRET"]    # raises if missing
-
-
 
 # Ignore views/ATC from these IPs/CIDRs
 IGNORE_IPS = [
@@ -132,6 +132,8 @@ ATC_JSON          = "atc_counts.json"       # productId -> int
 SALES_JSON        = "sales_counts.json"     # productId -> int
 SALE_DATES_JSON   = "sale_dates.json"       # productId -> sorted list of YYYY-MM-DD
 PROCESSED_ORDERS  = "processed_orders.json" # set of order IDs to avoid double-count
+AGE_JSON          = "age_days.json"         # productId -> int (NEW)
+DOB_CACHE_JSON    = "dob_cache.json"        # productId -> "YYYY-MM-DD" (NEW)
 
 # ---- State ----
 app = Flask(__name__)
@@ -141,11 +143,14 @@ view_counts  = defaultdict(int)    # productId -> views total
 atc_counts   = defaultdict(int)    # productId -> added-to-cart total
 sales_counts = defaultdict(int)    # productId -> sales total (units or orders)
 sale_dates   = defaultdict(set)    # productId -> set of date strings
+age_days     = defaultdict(int)    # productId -> age in days (NEW)
+dob_cache    = {}                  # productId -> DOB string (NEW)
 processed_orders = set()           # seen order IDs (to dedupe webhook retries)
 
 dirty_views = set()                # {(shop_host, productId)}
 dirty_atc   = set()                # {(shop_host, productId)}
 dirty_sales = set()                # {(shop_host, productId)}
+dirty_age   = set()                # {(shop_host, productId)} (NEW)
 
 # ---- Persistence helpers ----
 def _load_json(path, default):
@@ -187,6 +192,12 @@ _dates_disk = _load_json(SALE_DATES_JSON, {})
 for k, lst in _dates_disk.items():
     sale_dates[str(k)] = set(lst)
 
+_age_disk = _load_json(AGE_JSON, {})
+for k, v in _age_disk.items():
+    age_days[str(k)] = int(v)
+
+dob_cache.update(_load_json(DOB_CACHE_JSON, {}))
+
 processed_orders = set(_load_json(PROCESSED_ORDERS, []))
 
 def _persist_all():
@@ -194,6 +205,8 @@ def _persist_all():
     _save_json(ATC_JSON,  {k:int(v) for k,v in atc_counts.items()})
     _save_json(SALES_JSON,{k:int(v) for k,v in sales_counts.items()})
     _save_json(SALE_DATES_JSON, {k:sorted(list(v)) for k,v in sale_dates.items()})
+    _save_json(AGE_JSON, {k:int(v) for k,v in age_days.items()})
+    _save_json(DOB_CACHE_JSON, dob_cache)
     _save_json(PROCESSED_ORDERS, sorted(list(processed_orders)))
 
 def _cors(resp):
@@ -361,7 +374,7 @@ def orders_paid():
 
     return "ok", 200
 
-# --------- Push metafields periodically ---------
+# --------- Admin GraphQL helpers (used for push + DOB fetch) ---------
 def metafields_set(shop_host, token, metafields):
     url = f"https://{shop_host}/admin/api/{API_VERSION}/graphql.json"
     query = """
@@ -399,6 +412,47 @@ def metafields_set(shop_host, token, metafields):
         print(f"[{shop_host}] push error:", e)
         return False
 
+def fetch_product_dob(pid: str) -> str:
+    """
+    Return DOB 'YYYY-MM-DD' for product:
+    - Prefer custom.dob (date metafield)
+    - Fallback to product.createdAt date
+    Return '' on failure.
+    """
+    admin_host = list(ADMIN_TOKENS.keys())[0]
+    token = ADMIN_TOKENS[admin_host]
+    gid = f"gid://shopify/Product/{pid}"
+    query = """
+      query($id: ID!) {
+        node(id: $id) {
+          ... on Product {
+            createdAt
+            dob: metafield(namespace: "custom", key: "dob") { value }
+          }
+        }
+      }
+    """
+    try:
+        r = requests.post(
+            f"https://{admin_host}/admin/api/{API_VERSION}/graphql.json",
+            headers={"Content-Type": "application/json", "X-Shopify-Access-Token": token},
+            json={"query": query, "variables": {"id": gid}},
+            timeout=25
+        )
+        j = r.json()
+        node = (j.get("data") or {}).get("node") or {}
+        dob_val = ((node.get("dob") or {}) or {}).get("value")
+        if dob_val:  # already YYYY-MM-DD
+            return dob_val
+        created_at = node.get("createdAt")
+        if created_at:
+            dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+            return dt.date().isoformat()
+    except Exception as e:
+        print(f"[DOB] fetch error for {pid}: {e}")
+    return ""
+
+# --------- Push metafields periodically ---------
 def flusher():
     # Always push to the configured myshopify Admin host (first/only key)
     ADMIN_HOST = list(ADMIN_TOKENS.keys())[0]
@@ -408,22 +462,25 @@ def flusher():
         time.sleep(FLUSH_INTERVAL_SEC)
 
         with lock:
-            if not dirty_views and not dirty_atc and not dirty_sales:
+            if not dirty_views and not dirty_atc and not dirty_sales and not dirty_age:
                 continue
-            to_push = {}  # pid -> set("views","atc","sales")
+            to_push = {}  # pid -> set("views","atc","sales","age")
             for (_shop, pid) in dirty_views:
                 to_push.setdefault(pid, set()).add("views")
             for (_shop, pid) in dirty_atc:
                 to_push.setdefault(pid, set()).add("atc")
             for (_shop, pid) in dirty_sales:
                 to_push.setdefault(pid, set()).add("sales")
-            dirty_views.clear(); dirty_atc.clear(); dirty_sales.clear()
+            for (_shop, pid) in dirty_age:
+                to_push.setdefault(pid, set()).add("age")
+            dirty_views.clear(); dirty_atc.clear(); dirty_sales.clear(); dirty_age.clear()
 
         mfs = []
         for pid, kinds in to_push.items():
+            oid = f"gid://shopify/Product/{pid}"
             if "views" in kinds:
                 mfs.append({
-                    "ownerId": f"gid://shopify/Product/{pid}",
+                    "ownerId": oid,
                     "namespace": METAFIELD_NS,
                     "key": KEY_VIEWS,
                     "type": "number_integer",
@@ -431,7 +488,7 @@ def flusher():
                 })
             if "atc" in kinds:
                 mfs.append({
-                    "ownerId": f"gid://shopify/Product/{pid}",
+                    "ownerId": oid,
                     "namespace": METAFIELD_NS,
                     "key": KEY_ATC,
                     "type": "number_integer",
@@ -439,7 +496,7 @@ def flusher():
                 })
             if "sales" in kinds:
                 mfs.append({
-                    "ownerId": f"gid://shopify/Product/{pid}",
+                    "ownerId": oid,
                     "namespace": METAFIELD_NS,
                     "key": KEY_SALES,
                     "type": "number_integer",
@@ -447,11 +504,19 @@ def flusher():
                 })
                 dates = sorted(list(sale_dates.get(pid, set())))  # list.date expects JSON array of strings
                 mfs.append({
-                    "ownerId": f"gid://shopify/Product/{pid}",
+                    "ownerId": oid,
                     "namespace": METAFIELD_NS,
                     "key": KEY_DATES,
                     "type": "list.date",
                     "value": json.dumps(dates)
+                })
+            if "age" in kinds:
+                mfs.append({
+                    "ownerId": oid,
+                    "namespace": METAFIELD_NS,
+                    "key": KEY_AGE,
+                    "type": "number_integer",
+                    "value": str(int(age_days.get(pid, 0)))
                 })
 
         CHUNK = 25
@@ -466,13 +531,54 @@ def flusher():
 
         _persist_all()
 
+# --------- Daily age recompute (UTC) ---------
+def daily_age_updater():
+    """
+    Recompute age_in_days once per UTC day for any product we've seen
+    (in views, ATC, or sales). Uses custom.dob if present, else createdAt.
+    """
+    last_run_date = None
+    while True:
+        today = datetime.now(timezone.utc).date()
+        if today != last_run_date:
+            with lock:
+                pids = set(view_counts.keys()) | set(atc_counts.keys()) | set(sales_counts.keys())
+            changed = 0
+            for pid in pids:
+                dob = dob_cache.get(pid)
+                if not dob:
+                    dob = fetch_product_dob(pid)
+                    if dob:
+                        dob_cache[pid] = dob
+                if not dob:
+                    continue
+                try:
+                    if "T" in dob:
+                        dob_date = datetime.fromisoformat(dob.replace("Z","+00:00")).date()
+                    else:
+                        dob_date = datetime.strptime(dob, "%Y-%m-%d").date()
+                except Exception:
+                    continue
+                new_age = max((today - dob_date).days, 0)
+                old_age = age_days.get(pid, -1)
+                if new_age != old_age:
+                    age_days[pid] = new_age
+                    dirty_age.add(("rudradhan.com", pid))
+                    changed += 1
+            if changed:
+                print(f"[AGE] recomputed ages for {changed} product(s)")
+                _persist_all()
+            last_run_date = today
+        time.sleep(1800)  # check every 30 minutes
+
 # (Optional) manual flush during testing
 @app.route("/flush", methods=["GET"])
 def flush_now():
     return "flushing", 200
 
-# start background flusher
+# start background workers
 threading.Thread(target=flusher, daemon=True).start()
+threading.Thread(target=daily_age_updater, daemon=True).start()
 
 if __name__ == "__main__":
     print(f"Running on port {PORT} …")
