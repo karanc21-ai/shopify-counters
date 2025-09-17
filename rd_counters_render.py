@@ -519,6 +519,105 @@ def fetch_product_dob(pid: str) -> str:
     except Exception as e:
         print(f"[DOB] fetch error for {pid}: {e}")
     return ""
+def _list_all_product_nodes():
+    """
+    Returns a list of dicts: {"pid": "1234567890", "createdAt": "...", "dob": "YYYY-MM-DD" or None}
+    Uses Admin GraphQL pagination.
+    """
+    admin_host = list(ADMIN_TOKENS.keys())[0]
+    token = ADMIN_TOKENS[admin_host]
+    query = """
+      query($after: String) {
+        products(first: 200, after: $after) {
+          edges {
+            cursor
+            node {
+              id
+              createdAt
+              dob: metafield(namespace: "custom", key: "dob") { value }
+            }
+          }
+          pageInfo { hasNextPage }
+        }
+      }
+    """
+    nodes = []
+    after = None
+    while True:
+        r = requests.post(
+            f"https://{admin_host}/admin/api/{API_VERSION}/graphql.json",
+            headers={"Content-Type": "application/json", "X-Shopify-Access-Token": token},
+            json={"query": query, "variables": {"after": after}},
+            timeout=25
+        )
+        j = r.json()
+        data = (j.get("data") or {}).get("products") or {}
+        edges = data.get("edges") or []
+        for e in edges:
+            n = e.get("node") or {}
+            gid = n.get("id") or ""
+            pid = gid.split("/")[-1] if gid else ""
+            createdAt = n.get("createdAt")
+            dob = ((n.get("dob") or {}) or {}).get("value")
+            nodes.append({"pid": pid, "createdAt": createdAt, "dob": dob})
+        if not data.get("pageInfo", {}).get("hasNextPage"):
+            break
+        after = edges[-1]["cursor"] if edges else None
+        if not after:
+            break
+    return nodes
+
+def _seed_age_for_all_products():
+    """
+    Pull all products once and compute age_in_days for each (using custom.dob if present, else createdAt).
+    Marks dirty_age so the flusher writes to metafields.
+    """
+    today = datetime.now(timezone.utc).date()
+    nodes = _list_all_product_nodes()
+    changed = 0
+    for n in nodes:
+        pid = n["pid"]
+        if not pid:
+            continue
+        dob_str = n.get("dob")
+        if not dob_str:
+            createdAt = n.get("createdAt")
+            if not createdAt:
+                continue
+            try:
+                dt = datetime.fromisoformat(createdAt.replace("Z","+00:00"))
+                dob_str = dt.date().isoformat()
+            except Exception:
+                continue
+        # parse dob_str to date
+        try:
+            if "T" in dob_str:
+                dob_date = datetime.fromisoformat(dob_str.replace("Z","+00:00")).date()
+            else:
+                from datetime import datetime as dtmod
+                dob_date = dtmod.strptime(dob_str, "%Y-%m-%d").date()
+        except Exception:
+            continue
+
+        new_age = max((today - dob_date).days, 0)
+        old_age = age_days.get(pid, -1)
+        if new_age != old_age:
+            age_days[pid] = new_age
+            dob_cache[pid] = dob_str
+            dirty_age.add(("rudradhan.com", pid))
+            changed += 1
+    if changed:
+        _persist_all()
+    return changed
+
+# Endpoint to trigger seeding on demand
+@app.route("/age/seed_all", methods=["GET","POST"])
+def age_seed_all():
+    key = (request.args.get("key") or "").strip()
+    if key != PIXEL_SHARED_SECRET:
+        return "forbidden", 403
+    changed = _seed_age_for_all_products()
+    return f"seeded age for {changed} product(s)", 200
 
 # --------- Push metafields periodically ---------
 def flusher():
