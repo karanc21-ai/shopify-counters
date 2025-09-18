@@ -11,17 +11,22 @@ What it does
 - Age job (custom.age_in_days)            → computed ONLY from custom.dob (no fallback)
 - Pushes metafields via Admin GraphQL every FLUSH_INTERVAL_SEC
 
-New management endpoints (protected by ?key=PIXEL_SHARED_SECRET)
-----------------------------------------------------------------
-- POST/GET /age/recompute                → recompute age for products we've seen (views/ATC/sales)
-- POST/GET /age/seed_all                 → compute age for ALL products that ALREADY have custom.dob
-- POST      /dob/set                     → set DOB for a single product    (JSON: {"productId":"...","dob":"YYYY-MM-DD"})
-- POST      /dob/bulk                    → set DOB for many products       (JSON: [{"productId":"...","dob":"YYYY-MM-DD"},...])
-- POST/GET  /dob/backfill_created_at     → ONE-TIME convenience: set custom.dob = createdAt for products missing dob
+NEW (as requested)
+------------------
+- /dob/set_all_today (GET/POST)           → One-time bulk: set custom.dob = TODAY for ALL products, recompute age
+- /webhook/products_create (POST)         → On new product, set custom.dob = product.created_at and compute age
+
+Other admin endpoints (already present)
+---------------------------------------
+- /dob/set (POST)                         → body {"productId":"...","dob":"YYYY-MM-DD"}
+- /dob/bulk (POST)                        → body [{"productId":"...","dob":"YYYY-MM-DD"}, ...]
+- /dob/backfill_created_at (GET/POST)     → Set dob = createdAt for products missing dob (optional convenience)
+- /age/recompute  (GET/POST)              → recompute age for products we've seen
+- /age/seed_all   (GET/POST)              → compute age for all products that already have dob
 
 Notes
 -----
-- For age to show in Admin, create metafield definitions once:
+- In Shopify Admin, create metafield definitions once:
   Products → Settings → Custom data → Products → Add definition
     - custom.dob          = Date
     - custom.age_in_days  = Integer
@@ -106,16 +111,16 @@ KEY_DOB       = "dob"                     # date
 COUNT_MODE    = "units"                   # "units" or "orders"
 SALES_DATES_LIMIT = 365                   # keep up to N unique sale dates per product
 
-# Only this store for now; read token from environment (safer than hardcoding)
-ADMIN_HOST = os.getenv("ADMIN_HOST", "silver-rudradhan.myshopify.com")
+# Only this store; token from env
+ADMIN_HOST  = os.getenv("ADMIN_HOST", "silver-rudradhan.myshopify.com")
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")  # must be set in Render/local env
 if not ADMIN_TOKEN:
     raise RuntimeError("ADMIN_TOKEN env var is not set")
 ADMIN_TOKENS = {ADMIN_HOST: ADMIN_TOKEN}
 
 # Secrets from env (required)
-PIXEL_SHARED_SECRET    = os.environ["PIXEL_SHARED_SECRET"]       # raises if missing
-SHOPIFY_WEBHOOK_SECRET = os.environ["SHOPIFY_WEBHOOK_SECRET"]    # raises if missing
+PIXEL_SHARED_SECRET    = os.environ["PIXEL_SHARED_SECRET"]
+SHOPIFY_WEBHOOK_SECRET = os.environ["SHOPIFY_WEBHOOK_SECRET"]
 
 # Ignore views/ATC from these IPs/CIDRs
 IGNORE_IPS = [
@@ -202,7 +207,6 @@ for k, v in _age_disk.items():
     age_days[str(k)] = int(v)
 
 dob_cache.update(_load_json(DOB_CACHE_JSON, {}))
-
 processed_orders = set(_load_json(PROCESSED_ORDERS, []))
 
 def _persist_all():
@@ -259,7 +263,6 @@ def fetch_product_dob(pid: str) -> str:
 
 def _compute_age_for_pid(pid: str, today_date):
     """Compute & mark dirty age for one product. Returns True if changed."""
-    # fetch dob from cache or Admin
     dob = dob_cache.get(pid)
     if not dob:
         dob = fetch_product_dob(pid)
@@ -268,7 +271,6 @@ def _compute_age_for_pid(pid: str, today_date):
     if not dob:
         return False  # unknown DOB
 
-    # parse to date
     try:
         if "T" in dob:
             dob_date = datetime.fromisoformat(dob.replace("Z","+00:00")).date()
@@ -282,7 +284,7 @@ def _compute_age_for_pid(pid: str, today_date):
     old_age = age_days.get(pid, -1)
     if new_age != old_age:
         age_days[pid] = new_age
-        dirty_age.add(("rudradhan.com", pid))  # host value unused in push; just a marker
+        dirty_age.add(("rudradhan.com", pid))
         return True
     return False
 
@@ -301,19 +303,48 @@ def _recompute_age_for_known_pids():
         _persist_all()
     return changed
 
-# --------- DOB / AGE management endpoints ---------
-@app.route("/age/recompute", methods=["GET","POST"])
-def age_recompute_now():
-    key = (request.args.get("key") or "").strip()
-    if key != PIXEL_SHARED_SECRET:
-        return "forbidden", 403
-    changed = _recompute_age_for_known_pids()
-    return f"recomputed ages for {changed} product(s)", 200
+# --------- Admin GraphQL helpers ---------
+def metafields_set(shop_host, token, metafields):
+    url = f"https://{shop_host}/admin/api/{API_VERSION}/graphql.json"
+    query = """
+      mutation metafieldsSet($metafields: [MetafieldsSetInput!]!) {
+        metafieldsSet(metafields: $metafields) {
+          metafields { id key namespace ownerType }
+          userErrors { field message code }
+        }
+      }
+    """
+    try:
+        r = requests.post(
+            url,
+            headers={"Content-Type": "application/json", "X-Shopify-Access-Token": token},
+            json={"query": query, "variables": {"metafields": metafields}},
+            timeout=25
+        )
+        text = r.text
+        try:
+            j = r.json()
+        except Exception:
+            print(f"[GRAPHQL] non-JSON response {r.status_code}: {text[:500]}")
+            return False
 
+        errs = (j.get("data", {}) or {}).get("metafieldsSet", {}).get("userErrors", [])
+        if errs:
+            print(f"[GRAPHQL] userErrors ({shop_host}): {errs}")
+        ok = r.ok and not errs
+        if not ok:
+            if metafields:
+                print("[GRAPHQL] first metafield payload:", metafields[0])
+            print(f"[GRAPHQL] status={r.status_code}")
+        return ok
+    except Exception as e:
+        print(f"[{shop_host}] push error:", e)
+        return False
+
+# --------- Product listing ---------
 def _list_all_product_nodes():
     """
-    Returns a list of dicts: {"pid": "1234567890", "createdAt": "...", "dob": "YYYY-MM-DD" or None}
-    Uses Admin GraphQL pagination.
+    Returns: [{"pid": "1234567890", "createdAt": "...", "dob": "YYYY-MM-DD"|None}, ...]
     """
     admin_host = list(ADMIN_TOKENS.keys())[0]
     token = ADMIN_TOKENS[admin_host]
@@ -332,12 +363,11 @@ def _list_all_product_nodes():
         }
       }
     """
-    nodes = []
-    after = None
+    nodes, after = [], None
     while True:
         r = requests.post(
             f"https://{admin_host}/admin/api/{API_VERSION}/graphql.json",
-            headers={"Content-Type": "application/json", "X-Shopify-Access-Token": token},
+            headers={"Content-Type":"application/json","X-Shopify-Access-Token":token},
             json={"query": query, "variables": {"after": after}},
             timeout=25
         )
@@ -348,9 +378,11 @@ def _list_all_product_nodes():
             n = e.get("node") or {}
             gid = n.get("id") or ""
             pid = gid.split("/")[-1] if gid else ""
-            createdAt = n.get("createdAt")
-            dob = ((n.get("dob") or {}) or {}).get("value")
-            nodes.append({"pid": pid, "createdAt": createdAt, "dob": dob})
+            nodes.append({
+                "pid": pid,
+                "createdAt": n.get("createdAt"),
+                "dob": ((n.get("dob") or {}) or {}).get("value")
+            })
         if not data.get("pageInfo", {}).get("hasNextPage"):
             break
         after = edges[-1]["cursor"] if edges else None
@@ -358,53 +390,9 @@ def _list_all_product_nodes():
             break
     return nodes
 
-def _seed_age_for_all_products():
-    """
-    Compute age_in_days ONLY for products that already have custom.dob.
-    (No createdAt fallback here.)
-    """
-    today = datetime.now(timezone.utc).date()
-    nodes = _list_all_product_nodes()
-    changed = 0
-    for n in nodes:
-        pid = n["pid"]
-        if not pid:
-            continue
-        dob_str = n.get("dob")
-        if not dob_str:
-            continue  # skip if dob not set
-        # parse dob_str to date
-        try:
-            if "T" in dob_str:
-                dob_date = datetime.fromisoformat(dob_str.replace("Z","+00:00")).date()
-            else:
-                from datetime import datetime as dtmod
-                dob_date = dtmod.strptime(dob_str, "%Y-%m-%d").date()
-        except Exception:
-            continue
-
-        new_age = max((today - dob_date).days, 0)
-        old_age = age_days.get(pid, -1)
-        if new_age != old_age:
-            age_days[pid] = new_age
-            dob_cache[pid] = dob_str
-            dirty_age.add(("rudradhan.com", pid))
-            changed += 1
-    if changed:
-        _persist_all()
-    return changed
-
-@app.route("/age/seed_all", methods=["GET","POST"])
-def age_seed_all():
-    key = (request.args.get("key") or "").strip()
-    if key != PIXEL_SHARED_SECRET:
-        return "forbidden", 403
-    changed = _seed_age_for_all_products()
-    return f"seeded age for {changed} product(s)", 200
-
+# --------- DOB writers (single / bulk / special) ---------
 def _set_product_dob(pid: str, dob_str: str) -> bool:
     """Write custom.dob for a product; also compute its age immediately."""
-    # validate date format
     try:
         datetime.strptime(dob_str, "%Y-%m-%d")
     except Exception:
@@ -477,7 +465,6 @@ def dob_bulk():
         ok_all = ok_all and ok
         time.sleep(0.3)
 
-    # update cache + ages
     today = datetime.now(timezone.utc).date()
     for it in items:
         pid = str(it.get("productId") or "").strip()
@@ -492,11 +479,7 @@ def dob_bulk():
 
 @app.route("/dob/backfill_created_at", methods=["POST","GET"])
 def dob_backfill_created_at():
-    """
-    ONE-TIME convenience endpoint:
-    Set custom.dob = createdAt for products that currently don't have dob.
-    (This does NOT change the age logic — age still uses dob only.)
-    """
+    """Set custom.dob = createdAt for products that currently don't have dob."""
     key = (request.args.get("key") or "").strip()
     if key != PIXEL_SHARED_SECRET:
         return "forbidden", 403
@@ -544,7 +527,105 @@ def dob_backfill_created_at():
         time.sleep(0.3)
     return f"backfilled dob for {wrote} product(s)", 200
 
-# --------- PIXEL endpoints ---------
+@app.route("/dob/set_all_today", methods=["POST","GET"])
+def dob_set_all_today():
+    """
+    DANGER (bulk overwrite):
+    Sets custom.dob = TODAY for EVERY product, recomputes age=0, and pushes.
+    """
+    key = (request.args.get("key") or "").strip()
+    if key != PIXEL_SHARED_SECRET:
+        return "forbidden", 403
+
+    nodes = _list_all_product_nodes()
+    today = datetime.now(timezone.utc).date().isoformat()
+    admin_host = list(ADMIN_TOKENS.keys())[0]
+    token = ADMIN_TOKENS[admin_host]
+
+    to_write, touched = [], 0
+    for n in nodes:
+        pid = n.get("pid")
+        if not pid:
+            continue
+        to_write.append({
+            "ownerId": f"gid://shopify/Product/{pid}",
+            "namespace": METAFIELD_NS,
+            "key": KEY_DOB,
+            "type": "date",
+            "value": today
+        })
+        dob_cache[pid] = today
+        age_days[pid] = 0
+        dirty_age.add(("rudradhan.com", pid))
+        touched += 1
+
+    if not to_write:
+        return "no products found", 200
+
+    CHUNK = 25
+    wrote = 0
+    for i in range(0, len(to_write), CHUNK):
+        chunk = to_write[i:i+CHUNK]
+        ok = metafields_set(admin_host, token, chunk)
+        if ok:
+            wrote += len(chunk)
+        time.sleep(0.3)
+
+    _persist_all()
+    return f"set dob=today for {wrote}/{touched} product(s)", 200
+
+# --------- AGE recompute helpers ---------
+def _seed_age_for_all_products():
+    """
+    Compute age_in_days ONLY for products that already have custom.dob.
+    """
+    today = datetime.now(timezone.utc).date()
+    nodes = _list_all_product_nodes()
+    changed = 0
+    for n in nodes:
+        pid = n["pid"]
+        if not pid:
+            continue
+        dob_str = n.get("dob")
+        if not dob_str:
+            continue
+        try:
+            if "T" in dob_str:
+                dob_date = datetime.fromisoformat(dob_str.replace("Z","+00:00")).date()
+            else:
+                from datetime import datetime as dtmod
+                dob_date = dtmod.strptime(dob_str, "%Y-%m-%d").date()
+        except Exception:
+            continue
+
+        new_age = max((today - dob_date).days, 0)
+        old_age = age_days.get(pid, -1)
+        if new_age != old_age:
+            age_days[pid] = new_age
+            dob_cache[pid] = dob_str
+            dirty_age.add(("rudradhan.com", pid))
+            changed += 1
+    if changed:
+        _persist_all()
+    return changed
+
+@app.route("/age/seed_all", methods=["GET","POST"])
+def age_seed_all():
+    key = (request.args.get("key") or "").strip()
+    if key != PIXEL_SHARED_SECRET:
+        return "forbidden", 403
+    changed = _seed_age_for_all_products()
+    return f"seeded age for {changed} product(s)", 200
+
+@app.route("/age/recompute", methods=["GET","POST"])
+def age_recompute_now():
+    key = (request.args.get("key") or "").strip()
+    if key != PIXEL_SHARED_SECRET:
+        return "forbidden", 403
+    changed = _recompute_age_for_known_pids()
+    return f"recomputed ages for {changed} product(s)", 200
+
+# --------- PIXEL endpoints (views / ATC) ---------
 @app.route("/track/product", methods=["OPTIONS"])
 def track_options():
     return _cors(make_response("", 204))
@@ -567,7 +648,6 @@ def track_product():
     user_agent = (data.get("userAgent") or "").strip()
     shop_host  = normalize_host(data.get("shop"))
 
-    # only this storefront counts views
     if shop_host != "rudradhan.com":
         return _cors(make_response(("ok", 200)))
     if not product_id:
@@ -580,7 +660,6 @@ def track_product():
     with lock:
         view_counts[product_id] = int(view_counts.get(product_id, 0)) + 1
         dirty_views.add((shop_host, product_id))
-    # compute age immediately (if dob exists)
     try:
         _compute_age_for_pid(product_id, datetime.now(timezone.utc).date())
     except Exception:
@@ -611,7 +690,6 @@ def track_atc():
     user_agent = (data.get("userAgent") or "").strip()
     shop_host  = normalize_host(data.get("shop"))
 
-    # only this storefront counts ATC
     if shop_host != "rudradhan.com":
         return _cors(make_response(("ok", 200)))
     if not product_id:
@@ -626,7 +704,6 @@ def track_atc():
     with lock:
         atc_counts[product_id] = int(atc_counts.get(product_id, 0)) + qty
         dirty_atc.add((shop_host, product_id))
-    # compute age immediately (if dob exists)
     try:
         _compute_age_for_pid(product_id, datetime.now(timezone.utc).date())
     except Exception:
@@ -634,7 +711,7 @@ def track_atc():
 
     return _cors(make_response(("ok", 200)))
 
-# --------- WEBHOOK endpoint: /webhook/orders_paid (sales) ---------
+# --------- WEBHOOKS ---------
 def verify_hmac(req_body: bytes, header_hmac: str) -> bool:
     try:
         digest = hmac.new(
@@ -677,7 +754,7 @@ def orders_paid():
     date_str = dt.date().isoformat()
 
     lines = payload.get("line_items") or []
-    counted_in_order = set()  # for COUNT_MODE='orders'
+    counted_in_order = set()
 
     with lock:
         for li in lines:
@@ -703,7 +780,6 @@ def orders_paid():
                     sale_dates[pid] = set(newest_sorted)
 
             dirty_sales.add((shop_host, pid))
-            # compute age immediately (if dob exists)
             try:
                 _compute_age_for_pid(pid, datetime.now(timezone.utc).date())
             except Exception:
@@ -711,47 +787,57 @@ def orders_paid():
 
     return "ok", 200
 
-# --------- Admin GraphQL helpers (used for push) ---------
-def metafields_set(shop_host, token, metafields):
-    url = f"https://{shop_host}/admin/api/{API_VERSION}/graphql.json"
-    query = """
-      mutation metafieldsSet($metafields: [MetafieldsSetInput!]!) {
-        metafieldsSet(metafields: $metafields) {
-          metafields { id key namespace ownerType }
-          userErrors { field message code }
-        }
-      }
+@app.route("/webhook/products_create", methods=["POST"])
+def products_create():
     """
+    On product creation, set custom.dob = created_at (true DOB at birth),
+    compute age_in_days (0), and push.
+    """
+    h = request.headers.get("X-Shopify-Hmac-SHA256", "")
+    raw = request.get_data()
+    if not verify_hmac(raw, h):
+        return "unauthorized", 401
+
+    shop_host_hdr = request.headers.get("X-Shopify-Shop-Domain", "").strip()
+    shop_host = normalize_host(shop_host_hdr)
+    if shop_host not in ADMIN_TOKENS:
+        return "ok", 200
+
+    payload = request.get_json(silent=True) or {}
+    # Webhook payload has numeric product id and created_at
+    pid = str(payload.get("id") or "")
+    created_at = payload.get("created_at")
+
+    if not pid or not created_at:
+        return "ok", 200
+
     try:
-        r = requests.post(
-            url,
-            headers={"Content-Type": "application/json", "X-Shopify-Access-Token": token},
-            json={"query": query, "variables": {"metafields": metafields}},
-            timeout=25
-        )
-        text = r.text
-        try:
-            j = r.json()
-        except Exception:
-            print(f"[GRAPHQL] non-JSON response {r.status_code}: {text[:500]}")
-            return False
+        dob_date = datetime.fromisoformat(created_at.replace("Z","+00:00")).date()
+    except Exception:
+        dob_date = datetime.now(timezone.utc).date()
 
-        errs = (j.get("data", {}) or {}).get("metafieldsSet", {}).get("userErrors", [])
-        if errs:
-            print(f"[GRAPHQL] userErrors ({shop_host}): {errs}")
-        ok = r.ok and not errs
-        if not ok:
-            if metafields:
-                print("[GRAPHQL] first metafield payload:", metafields[0])
-            print(f"[GRAPHQL] status={r.status_code}")
-        return ok
-    except Exception as e:
-        print(f"[{shop_host}] push error:", e)
-        return False
+    dob_str = dob_date.isoformat()
+    admin_host = list(ADMIN_TOKENS.keys())[0]
+    token = ADMIN_TOKENS[admin_host]
 
-# --------- Push metafields periodically ---------
+    # Write DOB
+    ok = metafields_set(admin_host, token, [{
+        "ownerId": f"gid://shopify/Product/{pid}",
+        "namespace": METAFIELD_NS,
+        "key": KEY_DOB,
+        "type": "date",
+        "value": dob_str
+    }])
+
+    if ok:
+        dob_cache[pid] = dob_str
+        age_days[pid] = 0
+        dirty_age.add((shop_host, pid))
+
+    return "ok", 200
+
+# --------- Pusher ---------
 def flusher():
-    # Always push to the configured myshopify Admin host (first/only key)
     ADMIN_HOST = list(ADMIN_TOKENS.keys())[0]
     TOKEN = ADMIN_TOKENS[ADMIN_HOST]
 
@@ -798,7 +884,7 @@ def flusher():
                     "type": "number_integer",
                     "value": str(int(sales_counts.get(pid, 0)))
                 })
-                dates = sorted(list(sale_dates.get(pid, set())))  # list.date expects JSON array of strings
+                dates = sorted(list(sale_dates.get(pid, set())))
                 mfs.append({
                     "ownerId": f"gid://shopify/Product/{pid}",
                     "namespace": METAFIELD_NS,
@@ -829,10 +915,7 @@ def flusher():
 
 # --------- Daily age recompute (UTC) ---------
 def daily_age_updater():
-    """
-    Recompute age_in_days once per UTC day for any product we've seen (views/ATC/sales).
-    Uses custom.dob only (no createdAt fallback).
-    """
+    """Recompute age_in_days once per UTC day for products we've seen."""
     last_run_date = None
     while True:
         today = datetime.now(timezone.utc).date()
@@ -850,14 +933,14 @@ def daily_age_updater():
                 print(f"[AGE] recomputed ages for {changed} product(s)")
                 _persist_all()
             last_run_date = today
-        time.sleep(1800)  # check every 30 minutes
+        time.sleep(1800)
 
 # (Optional) manual flush during testing
 @app.route("/flush", methods=["GET"])
 def flush_now():
     return "flushing", 200
 
-# start background workers
+# Start background workers
 threading.Thread(target=flusher, daemon=True).start()
 threading.Thread(target=daily_age_updater, daemon=True).start()
 
